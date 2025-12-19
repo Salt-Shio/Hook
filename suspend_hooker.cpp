@@ -1,42 +1,35 @@
-#include <vector>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/user.h>
+
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
+#include <iostream>
+#include <fstream>
 
-u_int64_t get_base_addr(pid_t pid, const char* module_name) {
-    char filename[64];
-    char line[256];
-    FILE *fp;
-    u_int64_t start_addr = 0;
-    
-    snprintf(filename, sizeof(filename), "/proc/%d/maps", pid);
+#include <string>
+#include <vector>
 
-    fp = fopen(filename, "r");
-    if (!fp) {
-        perror("fopen maps");
-        return 0;
-    }
+u_int64_t get_module_base(pid_t pid, const std::string& module_keyword) {
+    std::ifstream maps("/proc/" + std::to_string(pid) + "/maps");
+    std::string line;
 
-    while (fgets(line, sizeof(line), fp)) {
-        
-        // 檢查是否為目標模組
-        if (strstr(line, module_name)) {
-            char *dash = strchr(line, '-'); // dash 指向 line 中 '-' 的位址
-            if (dash) {
-                *dash = '\0'; // 5be46a2bd000-5be46a2be000 ---> 5be46a2bd000\x005be46a2be000
-                start_addr = strtoul(line, NULL, 16); // 5be46a2bd000\x00 --> ul(5be46a2bd000\x00)
-                break; // 找到了就跳出，通常第一筆就是 Base
+    while (std::getline(maps, line)) {
+        if (line.find(module_keyword) != std::string::npos) {
+            size_t dash_pos = line.find('-');
+            if (dash_pos != std::string::npos) {
+                try {
+                    return std::stoull(line.substr(0, dash_pos), nullptr, 16);
+                } catch (...) { // for parse hex failed
+                    continue;
+                }
             }
         }
     }
-
-    fclose(fp);
-    return start_addr;
+    return 0; // 未找到
 }
 
 std::vector<u_int8_t> read_data(pid_t pid, u_int64_t address, int read_length) {
@@ -80,6 +73,7 @@ std::vector<u_int8_t> get_abs_jmp(u_int64_t targetAddr) {
     return code;
 }
 
+
 int main(int argc, char* argv[]) {
 
     if (argc < 2) {
@@ -92,41 +86,61 @@ int main(int argc, char* argv[]) {
     pid_t pid = fork(); 
     // 這裡會分出兩個一模一樣的程式，pid != 0 這個 pid 是子進程的 pid，pid == 0 表示自己是 子行程，因此要有兩個分支
 
-    if (pid == 0) { // === 子行程 (Target) ===
-        ptrace(PTRACE_TRACEME, 0, NULL, NULL); // 用 0 表示 trace 自己，這裡用 getpid 也能跑
+    if (pid == 0) { // Target
+        setenv("LD_PRELOAD", "./inject_lib.so", 1);
+        ptrace(PTRACE_TRACEME, 0, NULL, NULL); // 用 0 表示 trace 自己，這裡用 getpid 應該也能跑
         execl(target_elf, target_elf, NULL); // 跑起 elf，整個程式會換成 program_path 的內容
-        perror("execl failed");
+        perror("目標執行失敗");
         exit(1);
 
-    } else { // === 父行程 (Controller) ===
-        u_int64_t offset = 0x11d6;
+    } else { // Controller
+        u_int64_t main_offset = 0x1189;
+        u_int64_t hook_address = 0x11d6;
+        u_int64_t inject_offset = 0x1119;
+
         int status;
         printf("pid %d\n", pid);
         waitpid(pid, &status, 0);
 
         if (WIFSTOPPED(status)) {
-            u_int64_t base = get_base_addr(pid, &target_elf[2]);
-            printf("獲取目標 base address: %lx\n", base);
+            u_int64_t main_base = get_module_base(pid, &target_elf[2]);
+            printf("獲取目標 main_base address: %lx\n", main_base);
             
             std::vector<u_int8_t> read_bytes;
-            read_bytes = read_data(pid, base + offset, 16);
-            for (u_int8_t byte : read_bytes) {
-                printf("%02x ", byte);
+            std::vector<u_int8_t> write_bytes;
+
+            // stop at main (already load libc, my libc)
+            read_bytes = read_data(pid, main_base + main_offset, 8);
+            write_bytes.assign(read_bytes.begin(), read_bytes.end());
+            write_bytes[0] = 0xCC; // INT3
+            write_data(pid, main_base + main_offset, write_bytes);
+            ptrace(PTRACE_CONT, pid, NULL, NULL);
+            waitpid(pid, &status, 0);
+
+            if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP) {
+                u_int64_t inject_base = get_module_base(pid, "inject_lib.so");
+                printf("獲取目標 inject_base address: %lx\n", inject_base);
+
+                write_data(pid, main_base + main_offset, read_bytes); // delete INT3
+                struct user_regs_struct regs;
+                ptrace(PTRACE_GETREGS, pid, NULL, &regs);
+                regs.rip -= 1; 
+                ptrace(PTRACE_SETREGS, pid, NULL, &regs);
+                
+                printf("寫入 jmp code\n");
+                auto jmp_code = get_abs_jmp(inject_base + inject_offset);
+                write_data(pid, main_base + hook_address, jmp_code);
+                
+            } else {
+                printf("等待 wait 錯誤 2\n");    
             }
-            printf("\n");
-
-            std::vector<u_int8_t> write_bytes = get_abs_jmp(0xdeadbeefaabbccdd);
-            write_data(pid, base + offset, write_bytes);
-            printf("Press ENTER to detach...");
-            getchar();
-
         } else {
-            printf("Something went wrong, process didn't stop.\n");
+            printf("等待 wait 錯誤 1\n");
         
         }
         
         ptrace(PTRACE_DETACH, pid, NULL, SIGSTOP);
-        printf(">> Detached. Target resumes execution.\n");
+        printf("停止控制");
         while (true) {
             sleep(1);
         }
